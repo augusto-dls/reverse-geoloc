@@ -158,7 +158,7 @@ def text_to_wav(text):
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
                 f.write(mp3_buf.read()); tmp_mp3 = f.name
             tmp_wav = tmp_mp3.replace(".mp3", ".wav")
-            subprocess.run(["ffmpeg", "-y", "-i", tmp_mp3, "-ar", "22050", "-ac", "1", tmp_wav],
+            subprocess.run(["ffmpeg", "-y", "-i", tmp_mp3, "-ar", "8000", "-ac", "1", "-acodec", "pcm_u8", tmp_wav],
                            check=True, capture_output=True)
             wav = open(tmp_wav, "rb").read()
             os.unlink(tmp_mp3); os.unlink(tmp_wav)
