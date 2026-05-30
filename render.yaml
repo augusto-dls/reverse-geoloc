@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: gps-audio-server
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT --workers 2 --timeout 60
+    envVars:
+      - key: FLASK_DEBUG
+        value: false
+    # Plan gratuito de Render es suficiente para este proyecto
+    # El servicio duerme tras 15 min de inactividad en el plan free
+    # Para producción con ESP32 considerar el plan Starter ($7/mes)
