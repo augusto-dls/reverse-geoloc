@@ -74,7 +74,7 @@ def text_to_wav(text):
             tmp_wav = tmp_mp3.replace(".mp3", ".wav")
             subprocess.run(
                 ["ffmpeg", "-y", "-i", tmp_mp3,
-                 "-ar", "22050", "-ac", "1", "-acodec", "pcm_s16le", tmp_wav],
+                 "-ar", "16000", "-ac", "1", "-acodec", "pcm_s16le", tmp_wav],
                 check=True, capture_output=True
             )
             wav = open(tmp_wav, "rb").read()
