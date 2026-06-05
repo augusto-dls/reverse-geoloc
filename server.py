@@ -98,33 +98,55 @@ def fetch_reverse_geocode(lat, lon):
     return props
 
 
-def fetch_nearby_streets(lat, lon, radius=D_ESQUINA_PROX + 10):
+def fetch_nearby_streets(lat, lon):
     """
-    Busca calles/intersecciones cercanas usando reverse geocoding
-    con tipo 'street'. Devuelve lista de (nombre_calle, distancia_m).
+    Detecta calles transversales desplazando el punto en 4 direcciones
+    cardinales y comparando los nombres que devuelve cada reverse geocoding.
+
+    Por qué este enfoque: el reverse geocoding siempre devuelve el segmento
+    más cercano al punto dado. Para encontrar una calle transversal hay que
+    "mirar" lateralmente: si al desplazarse hacia el norte/sur/este/oeste
+    el nombre de calle cambia, es porque hay una intersección en esa dirección.
     """
-    features = _get(
-        "https://api.geoapify.com/v1/geocode/reverse",
-        {"lat": lat, "lon": lon, "lang": "es", "type": "street", "limit": 5},
-        "nearby_streets",
-    )
-    streets = []
-    for feat in features:
-        props = feat["properties"]
-        name = props.get("street") or props.get("name")
-        if not name:
+    main = fetch_reverse_geocode(lat, lon)
+    calle_principal = (main.get("street") or "").lower() if main else ""
+
+    # offset equivale a D_ESQUINA_PROX metros en grados (~111km por grado)
+    offset = D_ESQUINA_PROX / 111_000
+
+    puntos = [
+        (lat + offset, lon),   # norte
+        (lat - offset, lon),   # sur
+        (lat, lon + offset),   # este
+        (lat, lon - offset),   # oeste
+    ]
+
+    vistas = {}  # nombre -> distancia mínima al punto original
+    for p_lat, p_lon in puntos:
+        features = _get(
+            "https://api.geoapify.com/v1/geocode/reverse",
+            {"lat": p_lat, "lon": p_lon, "lang": "es"},
+            "street_probe",
+        )
+        if not features:
             continue
-        feat_lat = props.get("lat") or feat["geometry"]["coordinates"][1]
-        feat_lon = props.get("lon") or feat["geometry"]["coordinates"][0]
-        dist = haversine(lat, lon, feat_lat, feat_lon)
-        streets.append({"name": name, "dist_m": dist})
-    return streets
+        props = features[0]["properties"]
+        nombre = props.get("street") or props.get("name") or ""
+        if not nombre or nombre.lower() == calle_principal:
+            continue
+        dist = haversine(lat, lon, p_lat, p_lon)
+        if nombre not in vistas or vistas[nombre] > dist:
+            vistas[nombre] = dist
+
+    return [{"name": n, "dist_m": d} for n, d in vistas.items()]
 
 
 def fetch_nearby_places(lat, lon, radius=D_LUGAR_PROX + 20):
     """
     Busca lugares conocidos cercanos usando la Places API.
-    Devuelve lista de {name, categories, dist_m}.
+    Usa el campo 'distance' nativo de Geoapify cuando está disponible;
+    es más preciso que haversine al centroide porque Geoapify lo calcula
+    al borde del polígono del lugar.
     """
     features = _get(
         "https://api.geoapify.com/v2/places",
@@ -143,15 +165,17 @@ def fetch_nearby_places(lat, lon, radius=D_LUGAR_PROX + 20):
         name = props.get("name")
         if not name:
             continue
-        feat_lat = props.get("lat") or feat["geometry"]["coordinates"][1]
-        feat_lon = props.get("lon") or feat["geometry"]["coordinates"][0]
-        dist = haversine(lat, lon, feat_lat, feat_lon)
+        # Preferir 'distance' nativo; fallback a haversine al centroide
+        dist = props.get("distance")
+        if dist is None:
+            feat_lat = props.get("lat") or feat["geometry"]["coordinates"][1]
+            feat_lon = props.get("lon") or feat["geometry"]["coordinates"][0]
+            dist = haversine(lat, lon, feat_lat, feat_lon)
         places.append({
             "name": name,
             "categories": props.get("categories", []),
             "dist_m": dist,
         })
-    # Ordenar por distancia
     places.sort(key=lambda p: p["dist_m"])
     return places
 
