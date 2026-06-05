@@ -32,8 +32,8 @@ TTS_LANG         = "es"
 # ── Umbrales de distancia (metros) ────────────────────────────────────────────
 
 D_CALLE_MAX      = 50   # distancia máxima para considerar calle "cercana"
-D_ESQUINA        = 15   # distancia para "estar en la esquina"
-D_ESQUINA_PROX   = 30   # distancia para "próximo a" esquina
+D_ESQUINA        = 10   # offset chico: detecta transversal → "en la esquina"
+D_ESQUINA_PROX   = 40   # offset grande: detecta transversal → "próximo a esquina"
 D_LUGAR          = 15   # distancia para "estar en" el lugar
 D_LUGAR_PROX     = 50   # distancia para "próximo a" lugar
 
@@ -98,47 +98,53 @@ def fetch_reverse_geocode(lat, lon):
     return props
 
 
-def fetch_nearby_streets(lat, lon):
+def _probar_transversal(lat, lon, calle_principal, offset_m):
     """
-    Detecta calles transversales desplazando el punto en 4 direcciones
-    cardinales y comparando los nombres que devuelve cada reverse geocoding.
-
-    Por qué este enfoque: el reverse geocoding siempre devuelve el segmento
-    más cercano al punto dado. Para encontrar una calle transversal hay que
-    "mirar" lateralmente: si al desplazarse hacia el norte/sur/este/oeste
-    el nombre de calle cambia, es porque hay una intersección en esa dirección.
+    Desplaza el punto offset_m metros en las 4 direcciones cardinales y
+    devuelve el nombre de la primera calle distinta a calle_principal que
+    encuentre, o None si todas coinciden.
     """
-    main = fetch_reverse_geocode(lat, lon)
-    calle_principal = (main.get("street") or "").lower() if main else ""
-
-    # offset equivale a D_ESQUINA_PROX metros en grados (~111km por grado)
-    offset = D_ESQUINA_PROX / 111_000
-
+    offset = offset_m / 111_000
     puntos = [
-        (lat + offset, lon),   # norte
-        (lat - offset, lon),   # sur
-        (lat, lon + offset),   # este
-        (lat, lon - offset),   # oeste
+        (lat + offset, lon),
+        (lat - offset, lon),
+        (lat,          lon + offset),
+        (lat,          lon - offset),
     ]
-
-    vistas = {}  # nombre -> distancia mínima al punto original
     for p_lat, p_lon in puntos:
         features = _get(
             "https://api.geoapify.com/v1/geocode/reverse",
             {"lat": p_lat, "lon": p_lon, "lang": "es"},
-            "street_probe",
+            f"probe_{offset_m}m",
         )
         if not features:
             continue
         props = features[0]["properties"]
         nombre = props.get("street") or props.get("name") or ""
-        if not nombre or nombre.lower() == calle_principal:
-            continue
-        dist = haversine(lat, lon, p_lat, p_lon)
-        if nombre not in vistas or vistas[nombre] > dist:
-            vistas[nombre] = dist
+        if nombre and nombre.lower() != calle_principal.lower():
+            return nombre
+    return None
 
-    return [{"name": n, "dist_m": d} for n, d in vistas.items()]
+
+def fetch_nearby_streets(lat, lon, calle_principal):
+    """
+    Determina si hay una calle transversal cercana usando dos offsets:
+      - D_ESQUINA (10m):      si se detecta → "en la esquina"
+      - D_ESQUINA_PROX (40m): si se detecta → "próximo a esquina"
+
+    Retorna {"name": str, "en_esquina": bool} o None si no hay transversal.
+    """
+    # Primero prueba el offset chico (esquina)
+    nombre = _probar_transversal(lat, lon, calle_principal, D_ESQUINA)
+    if nombre:
+        return {"name": nombre, "en_esquina": True}
+
+    # Luego prueba el offset grande (próximo)
+    nombre = _probar_transversal(lat, lon, calle_principal, D_ESQUINA_PROX)
+    if nombre:
+        return {"name": nombre, "en_esquina": False}
+
+    return None
 
 
 def fetch_nearby_places(lat, lon, radius=D_LUGAR_PROX + 20):
@@ -234,25 +240,16 @@ def build_location_message(lat, lon):
     lugar_prox = next((p for p in places if p["dist_m"] <= D_LUGAR_PROX),  None)
 
     # ── Calles transversales (para esquina) ───────────────────────────────────
-    streets        = fetch_nearby_streets(lat, lon) if hay_calle else []
-    calle_base     = build_base_address(geo_props) if geo_props else None
-    # Filtrar la calle principal para encontrar transversales
+    calle_base      = build_base_address(geo_props) if geo_props else None
     calle_principal = geo_props.get("street", "") if geo_props else ""
-    transversales  = [
-        s for s in streets
-        if s["name"].lower() != calle_principal.lower()
-    ]
-    esquina_en     = next((s for s in transversales if s["dist_m"] <= D_ESQUINA),      None)
-    esquina_prox   = next((s for s in transversales if s["dist_m"] <= D_ESQUINA_PROX), None)
+    transversal     = fetch_nearby_streets(lat, lon, calle_principal) if hay_calle else None
 
     log.info(
-        "dist_calle=%.0fm hay_calle=%s lugar_en=%s lugar_prox=%s "
-        "esquina_en=%s esquina_prox=%s",
+        "dist_calle=%.0fm hay_calle=%s lugar_en=%s lugar_prox=%s transversal=%s",
         dist_calle, hay_calle,
         lugar_en["name"]   if lugar_en   else None,
         lugar_prox["name"] if lugar_prox else None,
-        esquina_en["name"] if esquina_en else None,
-        esquina_prox["name"] if esquina_prox else None,
+        transversal,
     )
 
     # ── Árbol de decisión ─────────────────────────────────────────────────────
@@ -275,15 +272,15 @@ def build_location_message(lat, lon):
         log.info("CASO 3 – dirección + en lugar")
         return f"{calle_base}, {lugar_en['name']}"
 
-    if esquina_en:
-        # CASO 1a: en la esquina
+    if transversal and transversal["en_esquina"]:
+        # CASO 1a: en la esquina (offset chico detectó transversal)
         log.info("CASO 1a – esquina")
-        return f"Esquina {calle_principal} y {esquina_en['name']}"
+        return f"Esquina {calle_principal} y {transversal['name']}"
 
-    if esquina_prox:
-        # CASO 2: dirección + próximo a calle (prioridad sobre lugar próximo)
+    if transversal and not transversal["en_esquina"]:
+        # CASO 2: próximo a calle (solo offset grande detectó transversal)
         log.info("CASO 2 – próximo a calle")
-        return f"{calle_base}, próximo a {esquina_prox['name']}"
+        return f"{calle_base}, próximo a {transversal['name']}"
 
     if lugar_prox:
         # CASO 4: dirección + próximo a lugar
