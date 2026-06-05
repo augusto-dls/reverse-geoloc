@@ -37,27 +37,21 @@ D_ESQUINA_PROX   = 30   # distancia para "próximo a" esquina
 D_LUGAR          = 15   # distancia para "estar en" el lugar
 D_LUGAR_PROX     = 50   # distancia para "próximo a" lugar
 
-# Categorías de lugares conocidos relevantes para orientación
+# Categorías de lugares conocidos relevantes para orientación.
+# Se usan categorías PADRE (sin subcategoría) para mayor compatibilidad:
+# la API devuelve todos sus hijos automáticamente.
+# Verificadas contra documentación oficial de Geoapify Places API.
 PLACE_CATEGORIES = ",".join([
-    "religion",
-    "education",
-    "healthcare",
-    "public_transport.bus_stop",
-    "public_transport.subway_entrance",
-    "leisure.park",
-    "leisure.playground",
-    "tourism.attraction",
-    "tourism.museum",
-    "tourism.information",
-    "office.government",
-    "amenity.police",
-    "amenity.fire_station",
-    "amenity.hospital",
-    "amenity.pharmacy",
-    "amenity.bank",
-    "amenity.post_office",
-    "commercial.supermarket",
-    "sport.stadium",
+    "religion",           # iglesias, templos, mezquitas
+    "education",          # escuelas, universidades, colegios
+    "healthcare",         # hospitales, farmacias, centros de salud
+    "public_transport",   # paradas de colectivo, estaciones, metro
+    "leisure.park",       # parques y plazas
+    "tourism",            # museos, monumentos, atracciones, info turística
+    "office.government",  # municipalidad, correo, organismos públicos
+    "service",            # policía, bomberos, servicios de emergencia
+    "commercial.supermarket",  # supermercados
+    "sport.stadium",      # estadios
 ])
 
 # ── Utilidades ────────────────────────────────────────────────────────────────
