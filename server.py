@@ -169,7 +169,7 @@ def location():
         return jsonify({"error": str(e)}), 502
 
     try:
-        audio_bytes, mime_type = text_to_wav(f"Estás en {address}, mi nigga")
+        audio_bytes, mime_type = text_to_wav(f"Estás en {address}, mi cieguito")
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
