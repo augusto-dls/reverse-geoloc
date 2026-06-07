@@ -1,10 +1,20 @@
 """
 GPS Audio Server
-Recibe coordenadas GPS → Geoapify (reverse geocoding) → TTS → WAV
+Recibe coordenadas GPS → Geoapify (reverse geocoding + places) → TTS → WAV
+
+Casos de respuesta:
+  1a. Esquina X e Y                          (en esquina, sin lugar cercano)
+  1b. Calle N                                (solo dirección)
+  2.  Calle N, próximo a Y                   (cerca de esquina, sin lugar)
+  3.  Calle N, <Lugar>                       (en lugar conocido)
+  4.  Calle N, próximo al <Lugar>            (cerca de lugar, sin esquina próxima)
+  5.  <Lugar>                                (sin calle cercana, hay lugar)
+  6.  <Calle> a X metros  [fallback]         (sin calle cercana ni lugar)
 """
 
 import io
 import os
+import math
 import logging
 import tempfile
 from flask import Flask, request, send_file, jsonify
@@ -19,40 +29,253 @@ app = Flask(__name__)
 GEOAPIFY_API_KEY = os.environ.get("GEOAPIFY_API_KEY", "")
 TTS_LANG         = "es"
 
+# ── Umbrales de distancia (metros) ────────────────────────────────────────────
 
-# ── Geocoding ─────────────────────────────────────────────────────────────────
+D_CALLE_MAX      = 50   # distancia máxima para considerar calle "cercana"
+D_ESQUINA_PROX   = 40   # radio del triángulo de prueba para detectar calle transversal
+D_LUGAR          = 15   # distancia para "estar en" el lugar
+D_LUGAR_PROX     = 50   # distancia para "próximo a" lugar
 
-def reverse_geocode(lat, lon):
-    url = "https://api.geoapify.com/v1/geocode/reverse"
-    params = {
-        "lat": lat,
-        "lon": lon,
-        "apiKey": GEOAPIFY_API_KEY,
-        "lang": "es",
-        "type": "amenity",
-    }
+# Categorías de lugares conocidos relevantes para orientación.
+# Se usan categorías PADRE (sin subcategoría) para mayor compatibilidad:
+# la API devuelve todos sus hijos automáticamente.
+# Verificadas contra documentación oficial de Geoapify Places API.
+PLACE_CATEGORIES = ",".join([
+    "religion",           # iglesias, templos, mezquitas
+    "education",          # escuelas, universidades, colegios
+    "healthcare",         # hospitales, farmacias, centros de salud
+    "public_transport",   # paradas de colectivo, estaciones, metro
+    "leisure.park",       # parques y plazas
+    "tourism",            # museos, monumentos, atracciones, info turística
+    "office.government",  # municipalidad, correo, organismos públicos
+    "service",            # policía, bomberos, servicios de emergencia
+    "commercial.supermarket",  # supermercados
+    "sport.stadium",      # estadios
+])
+
+# ── Utilidades ────────────────────────────────────────────────────────────────
+
+def haversine(lat1, lon1, lat2, lon2):
+    """Distancia en metros entre dos coordenadas."""
+    R = 6_371_000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+# ── Llamadas a Geoapify ───────────────────────────────────────────────────────
+
+def _get(url, params, label):
+    params["apiKey"] = GEOAPIFY_API_KEY
     resp = requests.get(url, params=params, timeout=10)
     resp.raise_for_status()
     data = resp.json()
+    log.info("%s → %d features", label, len(data.get("features", [])))
+    return data.get("features", [])
 
-    features = data.get("features", [])
+
+def fetch_reverse_geocode(lat, lon):
+    """
+    Devuelve el feature más cercano del reverse geocoding.
+    Incluye campo sintético 'distance_m' calculado desde (lat, lon).
+    """
+    features = _get(
+        "https://api.geoapify.com/v1/geocode/reverse",
+        {"lat": lat, "lon": lon, "lang": "es"},
+        "reverse_geocode",
+    )
     if not features:
-        raise ValueError("Geoapify: sin resultados")
+        return None
+    feat = features[0]
+    props = feat["properties"]
+    # Calcular distancia real al feature
+    feat_lat = props.get("lat") or feat["geometry"]["coordinates"][1]
+    feat_lon = props.get("lon") or feat["geometry"]["coordinates"][0]
+    props["_dist_m"] = haversine(lat, lon, feat_lat, feat_lon)
+    return props
 
-    props = features[0]["properties"]
+
+def fetch_nearby_streets(lat, lon, calle_principal):
+    """
+    Detecta si hay una calle transversal cercana usando 3 puntos dispuestos
+    en triángulo equilátero alrededor del usuario, a D_ESQUINA_PROX metros.
+
+    Ventaja sobre 4 puntos cardinales: cubre las direcciones de forma uniforme
+    sin dejar sectores de 90° sin explorar.
+
+    Los ángulos (0°, 120°, 240°) parten del norte y rotan en sentido horario.
+    La corrección cos(lat) en la longitud compensa la distorsión de grados
+    a latitudes alejadas del ecuador (relevante en Córdoba, -31°).
+
+    Retorna el nombre de la primera transversal encontrada, o None.
+    """
+    import math as _math
+
+    r = D_ESQUINA_PROX  # radio del triángulo en metros
+    lat_rad = _math.radians(lat)
+    angulos = [0, 120, 240]  # grados, partiendo del norte
+
+    for grados in angulos:
+        theta = _math.radians(grados)
+        p_lat = lat + (r * _math.cos(theta)) / 111_000
+        p_lon = lon + (r * _math.sin(theta)) / (111_000 * _math.cos(lat_rad))
+
+        features = _get(
+            "https://api.geoapify.com/v1/geocode/reverse",
+            {"lat": p_lat, "lon": p_lon, "lang": "es"},
+            f"probe_{grados}deg",
+        )
+        if not features:
+            continue
+        props = features[0]["properties"]
+        nombre = props.get("street") or props.get("name") or ""
+        if nombre and nombre.lower() != calle_principal.lower():
+            log.info("Transversal detectada: %s (ángulo %d°)", nombre, grados)
+            return nombre
+
+    return None
+
+
+def fetch_nearby_places(lat, lon, radius=D_LUGAR_PROX + 20):
+    """
+    Busca lugares conocidos cercanos usando la Places API.
+    Usa el campo 'distance' nativo de Geoapify cuando está disponible;
+    es más preciso que haversine al centroide porque Geoapify lo calcula
+    al borde del polígono del lugar.
+    """
+    features = _get(
+        "https://api.geoapify.com/v2/places",
+        {
+            "categories": PLACE_CATEGORIES,
+            "filter": f"circle:{lon},{lat},{radius}",
+            "bias": f"proximity:{lon},{lat}",
+            "limit": 5,
+            "lang": "es",
+        },
+        "nearby_places",
+    )
+    places = []
+    for feat in features:
+        props = feat["properties"]
+        name = props.get("name")
+        if not name:
+            continue
+        # Preferir 'distance' nativo; fallback a haversine al centroide
+        dist = props.get("distance")
+        if dist is None:
+            feat_lat = props.get("lat") or feat["geometry"]["coordinates"][1]
+            feat_lon = props.get("lon") or feat["geometry"]["coordinates"][0]
+            dist = haversine(lat, lon, feat_lat, feat_lon)
+        places.append({
+            "name": name,
+            "categories": props.get("categories", []),
+            "dist_m": dist,
+        })
+    places.sort(key=lambda p: p["dist_m"])
+    return places
+
+
+# ── Construcción de la dirección base ─────────────────────────────────────────
+
+def build_base_address(props):
+    """Construye 'Calle 123' o 'Calle' a partir de las propiedades del geocoding."""
     street      = props.get("street")
     housenumber = props.get("housenumber")
-    city        = props.get("city") or props.get("town") or props.get("village")
-
-    parts = []
+    if street and housenumber:
+        return f"{street} {housenumber}"
     if street:
-        parts.append(f"{street} {housenumber}" if housenumber else street)
-    if city:
-        parts.append(city)
+        return street
+    # Fallback: formatted
+    return props.get("formatted", "Dirección desconocida")
 
-    result = ", ".join(parts) if parts else props.get("formatted", "Dirección desconocida")
-    log.info("Dirección: %s", result)
-    return result
+
+def build_fallback_address(props):
+    """Para el caso 6: calle con distancia."""
+    name = (
+        props.get("street")
+        or props.get("road")
+        or props.get("name")
+        or props.get("formatted", "vía desconocida")
+    )
+    dist = props.get("_dist_m", 0)
+    return f"{name} a {int(round(dist))} metros"
+
+
+# ── Lógica de casos ───────────────────────────────────────────────────────────
+
+def build_location_message(lat, lon):
+    """
+    Aplica el árbol de decisión y devuelve el texto de ubicación.
+
+    Casos:
+      1a. Esquina X e Y
+      1b. Calle N
+      2.  Calle N, próximo a Y
+      3.  Calle N, <Lugar>
+      4.  Calle N, próximo al <Lugar>
+      5.  <Lugar>
+      6.  <Calle> a X metros  [fallback]
+    """
+    # Obtener datos en paralelo conceptual (secuencial aquí por simplicidad)
+    geo_props = fetch_reverse_geocode(lat, lon)
+    places    = fetch_nearby_places(lat, lon)
+
+    # ── Distancia a la calle más cercana ──────────────────────────────────────
+    dist_calle = geo_props["_dist_m"] if geo_props else float("inf")
+    hay_calle  = dist_calle <= D_CALLE_MAX
+
+    # ── Lugar más cercano ─────────────────────────────────────────────────────
+    lugar_en   = next((p for p in places if p["dist_m"] <= D_LUGAR),       None)
+    lugar_prox = next((p for p in places if p["dist_m"] <= D_LUGAR_PROX),  None)
+
+    # ── Calles transversales (para esquina) ───────────────────────────────────
+    calle_base      = build_base_address(geo_props) if geo_props else None
+    calle_principal = geo_props.get("street", "") if geo_props else ""
+    transversal     = fetch_nearby_streets(lat, lon, calle_principal) if hay_calle else None
+
+    log.info(
+        "dist_calle=%.0fm hay_calle=%s lugar_en=%s lugar_prox=%s transversal=%s",
+        dist_calle, hay_calle,
+        lugar_en["name"]   if lugar_en   else None,
+        lugar_prox["name"] if lugar_prox else None,
+        transversal,
+    )  # transversal es str con nombre de calle o None
+
+    # ── Árbol de decisión ─────────────────────────────────────────────────────
+
+    if not hay_calle:
+        if lugar_prox:
+            # CASO 5: solo lugar
+            log.info("CASO 5 – solo lugar")
+            return lugar_prox["name"]
+        else:
+            # CASO 6: fallback con distancia
+            log.info("CASO 6 – fallback con distancia")
+            if geo_props:
+                return build_fallback_address(geo_props)
+            return "Ubicación no disponible"
+
+    # Hay calle cercana
+    if lugar_en:
+        # CASO 3: dirección + en lugar
+        log.info("CASO 3 – dirección + en lugar")
+        return f"{calle_base}, {lugar_en['name']}"
+
+    if transversal:
+        # CASO 2: dirección + próximo a calle
+        log.info("CASO 2 – próximo a calle")
+        return f"{calle_base}, próximo a {transversal}"
+
+    if lugar_prox:
+        # CASO 4: dirección + próximo a lugar
+        log.info("CASO 4 – próximo a lugar")
+        return f"{calle_base}, próximo a {lugar_prox['name']}"
+
+    # CASO 1b: solo dirección
+    log.info("CASO 1b – solo dirección")
+    return calle_base
 
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
@@ -109,6 +332,17 @@ def text_to_wav(text):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+def _parse_coords(data):
+    """Parsea y valida lat/lon del body JSON. Lanza ValueError si hay error."""
+    try:
+        lat, lon = float(data["lat"]), float(data["lon"])
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("lat y lon requeridos y numéricos")
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        raise ValueError("Coordenadas fuera de rango")
+    return lat, lon
+
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok"})
@@ -116,61 +350,63 @@ def health():
 
 @app.route("/location/plain", methods=["POST"])
 def location_plain():
-    """Devuelve la dirección como texto plano. Ideal para ESP32."""
+    """Devuelve el mensaje de ubicación como texto plano. Ideal para ESP32."""
     data = request.get_json(force=True, silent=True)
     if not data:
         return "error: se esperaba JSON", 400
     try:
-        lat, lon = float(data["lat"]), float(data["lon"])
-    except (KeyError, TypeError, ValueError):
-        return "error: lat y lon requeridos", 400
+        lat, lon = _parse_coords(data)
+    except ValueError as e:
+        return f"error: {e}", 400
     try:
-        address = reverse_geocode(lat, lon)
-        return address, 200, {"Content-Type": "text/plain; charset=utf-8"}
+        msg = build_location_message(lat, lon)
+        return msg, 200, {"Content-Type": "text/plain; charset=utf-8"}
     except Exception as e:
+        log.exception("Error en /location/plain")
         return str(e), 502
 
 
 @app.route("/location/text", methods=["POST"])
 def location_text():
-    """Devuelve la dirección como JSON."""
+    """Devuelve el mensaje de ubicación como JSON."""
     data = request.get_json(force=True, silent=True)
     if not data:
         return jsonify({"error": "Se esperaba JSON"}), 400
     try:
-        lat, lon = float(data["lat"]), float(data["lon"])
-    except (KeyError, TypeError, ValueError):
-        return jsonify({"error": "lat y lon requeridos"}), 400
+        lat, lon = _parse_coords(data)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
     try:
-        address = reverse_geocode(lat, lon)
-        return jsonify({"lat": lat, "lon": lon, "address": address})
+        msg = build_location_message(lat, lon)
+        return jsonify({"lat": lat, "lon": lon, "address": msg})
     except Exception as e:
+        log.exception("Error en /location/text")
         return jsonify({"error": str(e)}), 502
 
 
 @app.route("/location", methods=["POST"])
 def location():
-    """Devuelve un archivo WAV con la dirección hablada."""
+    """Devuelve un archivo WAV con la ubicación hablada."""
     data = request.get_json(force=True, silent=True)
     if not data:
         return jsonify({"error": "Se esperaba JSON con 'lat' y 'lon'"}), 400
     try:
-        lat, lon = float(data["lat"]), float(data["lon"])
-    except (KeyError, TypeError, ValueError):
-        return jsonify({"error": "lat y lon requeridos y numéricos"}), 400
-    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
-        return jsonify({"error": "Coordenadas fuera de rango"}), 400
+        lat, lon = _parse_coords(data)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
 
     log.info("Solicitud: lat=%.6f lon=%.6f", lat, lon)
 
     try:
-        address = reverse_geocode(lat, lon)
+        msg = build_location_message(lat, lon)
     except Exception as e:
+        log.exception("Error construyendo mensaje")
         return jsonify({"error": str(e)}), 502
 
     try:
-        audio_bytes, mime_type = text_to_wav(f"Estás en {address}, mi nico bonito")
+        audio_bytes, mime_type = text_to_wav(msg)
     except Exception as e:
+        log.exception("Error generando audio")
         return jsonify({"error": str(e)}), 500
 
     ext = "wav" if "wav" in mime_type else "mp3"
